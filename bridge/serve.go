@@ -1,85 +1,207 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"log"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 )
 
-// runServe — режим моста. Читает построчно JSON-RPC из stdin, прокачивает в 1С через
-// COM и пишет компактные JSON-ответы в stdout (по одному на строку, как требует
-// stdio-транспорт MCP). Диагностика идёт в stderr, чтобы не мешать протоколу.
+// runServe — HTTP-прокси MCP-клиента к HTTP-сервису 1С.
+// Клиент ходит на Listen+Path (по умолчанию :8787/mcp); прокси добавляет
+// Basic-auth и пересылает запрос в Upstream. STDIO-транспорт не используется.
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	configPath := fs.String("config", "", "путь к файлу конфигурации")
-	connect := fs.String("connect", "", "полная строка соединения 1С (переопределяет конфиг)")
+	listen := fs.String("listen", "", "адрес слушателя (переопределяет конфиг / RSV_LISTEN)")
+	upstream := fs.String("upstream", "", "URL HTTP-сервиса 1С (переопределяет конфиг / RSV_UPSTREAM)")
 	_ = fs.Parse(args)
 
-	cfg, err := resolveConfig(*configPath, *connect)
+	cfg, err := resolveConfig(*configPath, "")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "rsvdata-bridge:", err)
+		// В Docker часто нет файла — достаточно переменных окружения.
+		cfg = &Config{}
+	}
+	cfg.applyEnv()
+	if *listen != "" {
+		cfg.Listen = *listen
+	}
+	if *upstream != "" {
+		cfg.Upstream = *upstream
+	}
+
+	if !cfg.HasHTTPUpstream() {
+		fmt.Fprintln(os.Stderr, "rsvdata-bridge: не задан upstream (RSV_UPSTREAM, --upstream или поле upstream в конфиге)")
 		os.Exit(1)
 	}
 
-	onec, err := NewOneC(cfg.ConnectString())
+	proxy := &httpProxy{cfg: cfg, client: &http.Client{Timeout: 120 * time.Second}}
+	mux := http.NewServeMux()
+	path := cfg.MCPPath()
+	mux.HandleFunc(path, proxy.handle)
+	// Частый вариант: клиент бьёт в корень — тоже принимаем.
+	if path != "/" {
+		mux.HandleFunc("/", proxy.handle)
+	}
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok\n")
+	})
+
+	addr := cfg.ListenAddr()
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           loggingHandler(mux),
+		ReadHeaderTimeout: 15 * time.Second,
+	}
+
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "rsvdata-bridge: подключение к 1С не удалось:", err)
+		fmt.Fprintln(os.Stderr, "rsvdata-bridge: не удалось слушать", addr+":", err)
 		os.Exit(1)
 	}
-	defer onec.Close()
-	fmt.Fprintln(os.Stderr, "rsvdata-bridge: соединение с 1С установлено, мост готов")
 
-	reader := bufio.NewReader(os.Stdin)
-	writer := bufio.NewWriter(os.Stdout)
+	fmt.Fprintf(os.Stderr, "rsvdata-bridge: HTTP-прокси слушает %s%s → %s\n",
+		displayListen(addr), path, cfg.UpstreamURL())
 
-	for {
-		line, readErr := reader.ReadBytes('\n')
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) > 0 {
-			handleLine(onec, trimmed, writer)
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintln(os.Stderr, "rsvdata-bridge: сервер остановлен:", err)
+			os.Exit(1)
 		}
-		if readErr != nil {
-			if readErr != io.EOF {
-				fmt.Fprintln(os.Stderr, "rsvdata-bridge: чтение stdin:", readErr)
-			}
-			return
-		}
-	}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
 }
 
-func handleLine(onec *OneC, reqLine []byte, writer *bufio.Writer) {
-	resp, err := onec.Process(string(reqLine))
+func displayListen(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		return "0.0.0.0" + addr
+	}
+	return addr
+}
+
+type httpProxy struct {
+	cfg    *Config
+	client *http.Client
+}
+
+func (p *httpProxy) handle(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, Mcp-Session-Id")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "rsvdata-bridge:", err)
-		resp = errorResponse(extractID(reqLine), -32000, "Мост 1С: "+err.Error())
+		http.Error(w, "не удалось прочитать тело запроса", http.StatusBadRequest)
+		return
 	}
-	if strings.TrimSpace(resp) == "" {
-		return // уведомление — ответа нет
+	_ = r.Body.Close()
+
+	out, status, err := p.forward(r.Context(), r.Method, r.Header, body)
+	if err != nil {
+		log.Printf("upstream error: %v", err)
+		writeJSONError(w, extractID(body), -32000, "Прокси 1С: "+err.Error())
+		return
 	}
-	writeResponse(writer, resp)
+	if status == 0 {
+		status = http.StatusOK
+	}
+
+	// Уведомления MCP без id могут вернуть пустое тело — отдаём 202.
+	if len(bytes.TrimSpace(out)) == 0 {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write(compactJSON(out))
+	if len(out) > 0 && out[len(out)-1] != '\n' {
+		_, _ = w.Write([]byte{'\n'})
+	}
 }
 
-// writeResponse пишет ответ одной строкой. JSON компактируется (json.Compact убирает
-// форматирующие переводы строк, не трогая содержимое) — иначе многострочный JSON от 1С
-// сломал бы построчное кадрирование stdio-транспорта.
-func writeResponse(writer *bufio.Writer, resp string) {
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, []byte(resp)); err == nil {
-		writer.Write(buf.Bytes())
+func (p *httpProxy) forward(ctx context.Context, method string, hdr http.Header, body []byte) ([]byte, int, error) {
+	if method == "" {
+		method = http.MethodPost
+	}
+	req, err := http.NewRequestWithContext(ctx, method, p.cfg.UpstreamURL(), bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Пробрасываем заголовки протокола MCP; Authorization всегда наш (к 1С).
+	if ct := hdr.Get("Content-Type"); ct != "" {
+		req.Header.Set("Content-Type", ct)
+	} else if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if accept := hdr.Get("Accept"); accept != "" {
+		req.Header.Set("Accept", accept)
 	} else {
-		// На всякий случай: вычистим переводы строк вручную.
-		writer.WriteString(strings.NewReplacer("\r", "", "\n", "").Replace(resp))
+		req.Header.Set("Accept", "application/json, text/event-stream")
 	}
-	writer.WriteByte('\n')
-	writer.Flush()
+	if sid := hdr.Get("Mcp-Session-Id"); sid != "" {
+		req.Header.Set("Mcp-Session-Id", sid)
+	}
+	if auth := p.cfg.BasicAuth(); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return data, resp.StatusCode, fmt.Errorf("HTTP 401 — неверный логин или пароль к 1С")
+	}
+	if resp.StatusCode >= 400 {
+		return data, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	return data, resp.StatusCode, nil
 }
 
-// extractID достаёт id входящего JSON-RPC запроса (для корректного ответа об ошибке).
+func compactJSON(in []byte) []byte {
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, in); err == nil {
+		return buf.Bytes()
+	}
+	return bytes.ReplaceAll(bytes.ReplaceAll(in, []byte("\r"), nil), []byte("\n"), nil)
+}
+
+func writeJSONError(w http.ResponseWriter, id json.RawMessage, code int, message string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK) // JSON-RPC ошибки — в теле, HTTP 200
+	_, _ = io.WriteString(w, errorResponse(id, code, message)+"\n")
+}
+
 func extractID(reqLine []byte) json.RawMessage {
 	var m struct {
 		ID json.RawMessage `json:"id"`
@@ -104,4 +226,12 @@ func errorResponse(id json.RawMessage, code int, message string) string {
 	payload.Error.Message = message
 	b, _ := json.Marshal(payload)
 	return string(b)
+}
+
+func loggingHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
+	})
 }

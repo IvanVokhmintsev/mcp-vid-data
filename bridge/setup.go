@@ -15,22 +15,44 @@ import (
 	"time"
 )
 
-// runPing — разовая проверка связи через COM (диагностика для режима моста).
+// runPing — разовая проверка связи с upstream по HTTP (основной путь)
+// или через COM на Windows (--connect / старый конфиг).
 //
 //	rsvdata-bridge ping
 //	rsvdata-bridge ping --method tools/list
-//	rsvdata-bridge ping --connect 'File="..."' --method ping
+//	rsvdata-bridge ping --upstream 'http://…/hs/rsvdata/mcp'
 func runPing(args []string) {
 	fs := flag.NewFlagSet("ping", flag.ExitOnError)
 	configPath := fs.String("config", "", "путь к файлу конфигурации")
-	connect := fs.String("connect", "", "полная строка соединения 1С (переопределяет конфиг)")
+	connect := fs.String("connect", "", "полная строка соединения 1С (COM, Windows)")
+	upstream := fs.String("upstream", "", "URL HTTP-сервиса 1С")
 	method := fs.String("method", "ping", "MCP-метод (ping, tools/list, initialize, tools/call)")
 	params := fs.String("params", "", "JSON параметров (для tools/call)")
 	_ = fs.Parse(args)
 
 	cfg, err := resolveConfig(*configPath, *connect)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "rsvdata-bridge:", err)
+		cfg = &Config{}
+	}
+	cfg.applyEnv()
+	if *upstream != "" {
+		cfg.Upstream = *upstream
+	}
+
+	req := buildRequest(*method, *params)
+
+	if cfg.HasHTTPUpstream() {
+		resp, err := postUpstream(cfg.UpstreamURL(), cfg.BasicAuth(), req)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "rsvdata-bridge: вызов не удался:", err)
+			os.Exit(1)
+		}
+		fmt.Println(resp)
+		return
+	}
+
+	if !cfg.HasCOMConnect() {
+		fmt.Fprintln(os.Stderr, "rsvdata-bridge: задайте RSV_UPSTREAM / --upstream или COM --connect")
 		os.Exit(1)
 	}
 
@@ -41,13 +63,39 @@ func runPing(args []string) {
 	}
 	defer onec.Close()
 
-	req := buildRequest(*method, *params)
 	resp, err := onec.Process(req)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "rsvdata-bridge: вызов не удался:", err)
 		os.Exit(1)
 	}
 	fmt.Println(resp)
+}
+
+// postUpstream шлёт произвольный JSON-RPC в HTTP-сервис 1С.
+func postUpstream(url, auth, body string) (string, error) {
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusUnauthorized {
+		return "", fmt.Errorf("HTTP 401 — неверный логин или пароль")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	return string(data), nil
 }
 
 func buildRequest(method, params string) string {
@@ -80,8 +128,8 @@ func runSetup(args []string) {
 	fmt.Println("Подключим ИИ-клиент (Claude, Cursor) к данным вашей базы 1С.")
 	fmt.Println()
 	fmt.Println("Способы подключения:")
-	fmt.Println("  [1] HTTP-сервис 1С — база опубликована на веб-сервере.")
-	fmt.Println("  [2] Локальный мост — напрямую к базе (COM), без публикации (Windows).")
+	fmt.Println("  [1] Напрямую к HTTP-сервису 1С — клиент ходит в базу сам.")
+	fmt.Println("  [2] Через HTTP-прокси (Docker/Linux) — креды в прокси, клиент без пароля.")
 	method := askChoice(in, "Выберите способ (1 или 2)", []string{"1", "2"})
 	fmt.Println()
 
@@ -94,7 +142,7 @@ func runSetup(args []string) {
 	if method == "1" {
 		setupHTTP(in, name)
 	} else {
-		setupBridge(in, name, *configPath)
+		setupProxy(in, name, *configPath)
 	}
 }
 
@@ -148,47 +196,68 @@ func setupHTTP(in *bufio.Reader, name string) {
 
 // httpServer строит описание HTTP-сервера в формате выбранного клиента.
 // Тип транспорта у клиентов разный: Claude Code/VS Code — "http", Cline — "streamableHttp",
-// Cursor — "streamable-http". Заголовки авторизации поддерживают все три.
+// Cursor — "streamable-http". auth пустой — заголовок Authorization не добавляется
+// (режим прокси: креды на стороне прокси).
 func httpServer(client, url, auth string) map[string]any {
-	headers := map[string]any{"Authorization": auth}
+	var headers map[string]any
+	if strings.TrimSpace(auth) != "" {
+		headers = map[string]any{"Authorization": auth}
+	}
 	switch client {
 	case "2": // Cursor
-		return map[string]any{"type": "streamable-http", "url": url, "headers": headers}
+		m := map[string]any{"type": "streamable-http", "url": url}
+		if headers != nil {
+			m["headers"] = headers
+		}
+		return m
 	case "3": // Cline
-		return map[string]any{"type": "streamableHttp", "url": url, "headers": headers, "disabled": false}
+		m := map[string]any{"type": "streamableHttp", "url": url, "disabled": false}
+		if headers != nil {
+			m["headers"] = headers
+		}
+		return m
 	default: // Claude Code / VS Code
-		return map[string]any{"type": "http", "url": url, "headers": headers}
+		m := map[string]any{"type": "http", "url": url}
+		if headers != nil {
+			m["headers"] = headers
+		}
+		return m
 	}
 }
 
-// setupBridge — способ 2 (локальный мост через COM). При ошибке предлагает повтор
-// (теми же данными или с повторным вводом) — окно не закрывается.
-func setupBridge(in *bufio.Reader, name, configPath string) {
-	fmt.Println("--- Подключение через локальный мост (COM) ---")
-	fmt.Println("Веб-публикация не нужна. Логин/пароль сохранятся локально в вашем профиле.")
+// setupProxy — способ 2 (HTTP-прокси). Креды хранятся у прокси (файл / Docker env),
+// в конфиг клиента попадает только URL прокси без пароля.
+func setupProxy(in *bufio.Reader, name, configPath string) {
+	fmt.Println("--- Подключение через HTTP-прокси ---")
+	fmt.Println("Прокси принимает MCP по HTTP и пересылает в опубликованный сервис 1С.")
+	fmt.Println("Логин/пароль остаются в конфиге прокси (или в переменных Docker) —")
+	fmt.Println("в .mcp.json клиента их не будет. Основной запуск — Docker на Linux.")
 	fmt.Println()
 
-	cfg := askBridgeParams(in, nil)
+	cfg := askProxyParams(in, nil)
 
 	for {
 		fmt.Println()
-		fmt.Println("Проверяю связь с базой…")
-		err := tryBridge(cfg)
-		if err == nil {
-			fmt.Println("✓ Связь с базой есть, расширение RSVData отвечает.")
+		fmt.Println("Проверяю связь с HTTP-сервисом 1С…")
+		resp, err := testHTTP(cfg.UpstreamURL(), cfg.BasicAuth())
+		if err == nil && strings.Contains(resp, "result") {
+			fmt.Println("✓ Связь есть, расширение RSVData отвечает.")
 			break
 		}
-		fmt.Println("✗ Подключиться не удалось:", err)
-		fmt.Println("  Подсказка: для диагностики (какие расширения видны в базе) запустите")
-		fmt.Println("  rsvdata-bridge.exe diag — он покажет, активно ли расширение RSVData.")
+		if err != nil {
+			fmt.Println("✗ Не удалось проверить связь:", err)
+			fmt.Println("  Нужна опубликованная база с HTTP-сервисом RSVData.")
+		} else {
+			fmt.Println("✗ Сервис ответил неожиданно:", strings.TrimSpace(resp))
+		}
 		switch askRetry(in) {
 		case retrySame:
-			continue // те же параметры — например, вы обновили конфигурацию базы и пробуете снова
+			continue
 		case retryReenter:
-			cfg = askBridgeParams(in, cfg)
+			cfg = askProxyParams(in, cfg)
 			continue
 		default:
-			return // выход без сохранения
+			return
 		}
 	}
 
@@ -200,69 +269,54 @@ func setupBridge(in *bufio.Reader, name, configPath string) {
 		fmt.Println("✗ Не удалось сохранить настройки:", err)
 		return
 	}
-	fmt.Println("✓ Параметры подключения (база, логин, пароль) сохранены в файл:")
+	fmt.Println("✓ Параметры прокси сохранены в файл:")
 	fmt.Println("   ", path)
+	fmt.Println()
+	port := strings.TrimPrefix(cfg.ListenAddr(), ":")
+	if i := strings.LastIndex(cfg.ListenAddr(), ":"); i >= 0 {
+		port = cfg.ListenAddr()[i+1:]
+	}
+	fmt.Println("Запуск (Linux / Docker):")
+	fmt.Printf("  rsvdata-bridge serve --config %s\n", path)
+	fmt.Println("  # или:")
+	fmt.Printf("  docker run --rm -p %s:%s -e RSV_UPSTREAM=%q -e RSV_USER=%q -e RSV_PASSWORD=… rsvdata-bridge\n",
+		port, port, cfg.UpstreamURL(), cfg.User)
 
-	exe, _ := os.Executable()
-	deliverSnippet(in, name, map[string]any{
-		"type":    "stdio",
-		"command": exe,
-		"args":    []string{"serve", "--config", path},
-	})
+	client := askChoice(in, "Для какого клиента блок .mcp.json? [1] Claude Code / VS Code, [2] Cursor, [3] Cline", []string{"1", "2", "3"})
+	publicURL := ask(in, "URL прокси, который увидит клиент", proxyPublicURL(cfg))
+	deliverSnippet(in, name, httpServer(client, publicURL, ""))
 }
 
-// askBridgeParams спрашивает параметры файловой/серверной базы. prev (если задан) —
-// значения по умолчанию при повторном вводе.
-func askBridgeParams(in *bufio.Reader, prev *Config) *Config {
+// askProxyParams спрашивает listen / upstream / логин / пароль.
+func askProxyParams(in *bufio.Reader, prev *Config) *Config {
 	cfg := &Config{}
-	defKind := "1"
-	if prev != nil && prev.Kind == "server" {
-		defKind = "2"
-	}
-	kind := askChoiceDefault(in, "Тип базы — [1] файловая, [2] клиент-серверная", []string{"1", "2"}, defKind)
-	if kind == "2" {
-		cfg.Kind = "server"
-		ds, dr := "localhost", ""
-		if prev != nil {
-			if prev.Server != "" {
-				ds = prev.Server
-			}
-			dr = prev.Ref
-		}
-		cfg.Server = ask(in, "Адрес сервера 1С (например, localhost или srv:1541)", ds)
-		cfg.Ref = ask(in, "Имя базы на сервере", dr)
-	} else {
-		cfg.Kind = "file"
-		df := ""
-		if prev != nil {
-			df = prev.File
-		}
-		cfg.File = ask(in, `Путь к папке файловой базы (например, D:\Базы\МояБаза)`, df)
-	}
-	du := ""
+	dl, du, duser := defaultListen, "http://localhost/UT_Demo/hs/rsvdata/mcp", ""
 	if prev != nil {
-		du = prev.User
+		if prev.Listen != "" {
+			dl = prev.Listen
+		}
+		if prev.Upstream != "" {
+			du = prev.Upstream
+		}
+		duser = prev.User
 	}
-	cfg.User = ask(in, "Пользователь ИБ (логин)", du)
+	cfg.Listen = ask(in, "Адрес слушателя прокси", dl)
+	cfg.Upstream = ask(in, "Адрес HTTP-сервиса 1С (upstream)", du)
+	cfg.Path = defaultPath
+	cfg.User = ask(in, "Пользователь ИБ (логин)", duser)
 	cfg.Password = ask(in, "Пароль (Enter — пустой)", "")
 	return cfg
 }
 
-// tryBridge открывает COM-соединение, шлёт ping и проверяет ответ.
-func tryBridge(cfg *Config) error {
-	onec, err := NewOneC(cfg.ConnectString())
-	if err != nil {
-		return err
+// proxyPublicURL — URL, который мастер предлагает вписать в клиент.
+func proxyPublicURL(cfg *Config) string {
+	hostPort := cfg.ListenAddr()
+	if strings.HasPrefix(hostPort, ":") {
+		hostPort = "127.0.0.1" + hostPort
+	} else if strings.HasPrefix(hostPort, "0.0.0.0:") {
+		hostPort = "127.0.0.1:" + strings.TrimPrefix(hostPort, "0.0.0.0:")
 	}
-	defer onec.Close()
-	resp, err := onec.Process(pingRequest)
-	if err != nil {
-		return err
-	}
-	if !strings.Contains(resp, "result") {
-		return fmt.Errorf("база ответила без result: %s", strings.TrimSpace(resp))
-	}
-	return nil
+	return "http://" + hostPort + cfg.MCPPath()
 }
 
 type retryChoice int
