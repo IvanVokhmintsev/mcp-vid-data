@@ -1,0 +1,12 @@
+*.exe
+*.exe~
+.test-config.json
+.smoke-input.txt
+.smoke-output.txt
+.smoke-stderr.txt
+bridge.json
+*-input.txt
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore

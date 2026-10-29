@@ -1,0 +1,18 @@
+# Пример запуска HTTP-прокси MCP:RSV Data на Linux.
+# Скопируйте и подставьте RSV_UPSTREAM / RSV_USER / RSV_PASSWORD.
+services:
+  rsvdata-bridge:
+    build: .
+    image: rsvdata-bridge:local
+    ports:
+      - "8787:8787"
+    environment:
+      RSV_LISTEN: ":8787"
+      RSV_PATH: "/mcp"
+      RSV_UPSTREAM: "${RSV_UPSTREAM:-http://host.docker.internal/UT_Demo/hs/rsvdata/mcp}"
+      RSV_USER: "${RSV_USER:-}"
+      RSV_PASSWORD: "${RSV_PASSWORD:-}"
+    # На Linux host.docker.internal может потребовать extra_hosts:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
